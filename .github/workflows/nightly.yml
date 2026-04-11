@@ -62,7 +62,7 @@ jobs:
         run: chmod +x gradlew
 
       - name: Generate Tree-sitter grammar
-        run: ./gradlew generateTsGrammar
+        run: ./gradlew :core:generateTsGrammar --stacktrace
 
       - name: Build Android Release APK
         run: |
