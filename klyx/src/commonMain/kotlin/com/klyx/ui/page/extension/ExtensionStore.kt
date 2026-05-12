@@ -1,3 +1,5 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package com.klyx.ui.page.extension
 
 import com.klyx.core.KlyxBuildConfig
@@ -17,13 +19,15 @@ import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.io.buffered
 import kotlinx.io.files.Path
 import kotlinx.io.readByteArray
-import kotlinx.serialization.SerialName
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNamingStrategy
 import kotlin.io.encoding.Base64
 
 private const val STORE_INDEX_URL = "https://klyx-dev.github.io/extensions/index.json"
@@ -31,9 +35,7 @@ private const val WORKER_PUBLISH_URL = "https://publish-extension.klyx.workers.d
 
 @Serializable
 data class StoreRegistry(
-    @SerialName("store_version")
     val storeVersion: Int,
-    @SerialName("last_updated")
     val lastUpdated: String,
     val extensions: List<StoreExtension>
 )
@@ -45,20 +47,40 @@ data class StoreExtension(
     val author: String,
     val version: String,
     val description: String,
-    @SerialName("download_url")
-    val downloadUrl: String
+    val downloadUrl: String,
+    val downloadCount: Int = 0,
+    val publisherId: String = ""
 )
 
 @Serializable
 data class PublishPayload(
     val metadata: String,
-    val fileBase64: String
+    val fileBase64: String,
+    val publisherId: String
 )
 
 class ExtensionStore {
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
+        namingStrategy = JsonNamingStrategy.SnakeCase
+    }
+
+    suspend fun fetchDownloadCounts(): Map<String, Int> = withContext(Dispatchers.IO) {
+        try {
+            json.decodeFromString(fetchText("$WORKER_PUBLISH_URL/downloads"))
+        } catch (e: Exception) {
+            log.error { "Failed to fetch download counts: ${e.message}" }
+            emptyMap()
+        }
+    }
+
+    suspend fun incrementDownloadCount(extensionId: String) = withContext(Dispatchers.IO) {
+        try {
+            httpClient.post("$WORKER_PUBLISH_URL/download?id=$extensionId")
+        } catch (e: Exception) {
+            log.error { "Failed to increment download count for $extensionId: ${e.message}" }
+        }
     }
 
     suspend fun fetchStoreIndex(): List<StoreExtension> = withContext(Dispatchers.IO) {
@@ -77,41 +99,47 @@ class ExtensionStore {
             val targetFile = Path(destDir, "${ext.id}.kxext")
             val bytes = fetchBody(ext.downloadUrl)
             fs.sink(targetFile).buffered().use { it.write(bytes) }
+
+            launch { incrementDownloadCount(ext.id) }
+
             targetFile
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            log.error { "Failed to download extension ${ext.id}: ${e.message}" }
             null
         }
     }
 
-    suspend fun publishExtension(filePath: Path, metadata: ExtensionMetadata) = withContext(Dispatchers.IO) {
-        try {
-            val bytes = fs.source(filePath).buffered().use { it.readByteArray() }
+    suspend fun publishExtension(filePath: Path, metadata: ExtensionMetadata, publisherId: String) =
+        withContext(Dispatchers.IO) {
+            try {
+                val bytes = fs.source(filePath).buffered().use { it.readByteArray() }
 
-            val payload = PublishPayload(
-                metadata = json.encodeToString(metadata),
-                fileBase64 = Base64.encode(bytes)
-            )
+                val payload = PublishPayload(
+                    metadata = json.encodeToString(metadata),
+                    fileBase64 = Base64.encode(bytes),
+                    publisherId = publisherId
+                )
 
-            val response = httpClient.post(WORKER_PUBLISH_URL) {
-                contentType(ContentType.Application.Json)
-                bearerAuth(Base64.decode(KlyxBuildConfig.STORE_API_KEY).decodeToString())
-                setBody(json.encodeToString(payload))
-            }
-            response.status.isSuccess().also { success ->
-                if (!success) {
-                    log.error { "Failed to publish '${metadata.name}': ${response.status}" }
-                    val errorBody = response.bodyAsText()
-                    log.error { errorBody }
+                val response = httpClient.post(WORKER_PUBLISH_URL) {
+                    contentType(ContentType.Application.Json)
+                    bearerAuth(Base64.decode(KlyxBuildConfig.STORE_API_KEY).decodeToString())
+                    setBody(json.encodeToString(payload))
                 }
+                response.status.isSuccess().also { success ->
+                    if (!success) {
+                        log.error { "Failed to publish '${metadata.name}': ${response.status}" }
+                        val errorBody = response.bodyAsText()
+                        log.error { errorBody }
+                    }
+                }
+            } catch (_: Exception) {
+                false
             }
-        } catch (_: Exception) {
-            false
         }
-    }
 
-    suspend fun unpublishExtension(extensionId: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun unpublishExtension(extensionId: String, publisherId: String): Boolean = withContext(Dispatchers.IO) {
         try {
-            val response = httpClient.delete("$WORKER_PUBLISH_URL?id=$extensionId") {
+            val response = httpClient.delete("$WORKER_PUBLISH_URL?id=$extensionId&publisherId=$publisherId") {
                 bearerAuth(Base64.decode(KlyxBuildConfig.STORE_API_KEY).decodeToString())
             }
 
@@ -127,4 +155,3 @@ class ExtensionStore {
         }
     }
 }
-
